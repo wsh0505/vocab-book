@@ -1,0 +1,32 @@
+{
+    "name": "单词本 · 六级备考",
+    "short_name": "单词本",
+    "description": "离线背单词应用，支持艾宾浩斯遗忘曲线复习",
+    "start_url": "./index.html",
+    "scope": "./",
+    "display": "standalone",
+    "orientation": "any",
+    "background_color": "#f4f1ea",
+    "theme_color": "#4a6b57",
+    "lang": "zh-CN",
+    "icons": [
+        {
+            "src": "icons/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "icons/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "icons/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}
