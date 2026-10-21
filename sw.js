@@ -1,6 +1,6 @@
 /* Service Worker：缓存静态资源，保证离线可用 */
 /* 版本号：资源清单有变化时必须 +1，客户端才会替换缓存 */
-const CACHE_NAME = 'vocab-app-cache-v3';
+const CACHE_NAME = 'vocab-app-cache-v5';
 
 const ASSETS = [
     './',
@@ -10,6 +10,7 @@ const ASSETS = [
     './js/store.js',
     './js/schedule.js',
     './js/cover.js',
+    './js/tts.js',
     './js/app.js',
     './icons/icon-180.png',
     './icons/icon-192.png',

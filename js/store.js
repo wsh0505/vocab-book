@@ -64,8 +64,12 @@
             version: 1,
             books: [],
             settings: {
-                theme: 'system',   // system | light | dark
-                fontScale: 1       // 0.9 ~ 1.5
+                theme: 'system',     // system | light | dark
+                fontScale: 1,        // 0.9 ~ 1.5
+                voiceLang: 'en-US',  // en-US 美音 | en-GB 英音
+                speechRate: 1,       // 朗读语速 0.6 ~ 1.4
+                autoRead: true,      // 进入下一个单词时自动朗读
+                dailyGoal: 20        // 每天的学习目标（新学 + 复习，共多少个）
             }
         };
     }
@@ -92,6 +96,21 @@
         }
         if (typeof data.settings.fontScale !== 'number') {
             data.settings.fontScale = 1;
+        }
+        // 朗读相关：老数据没有这三项就补默认值，不影响已有字段
+        if (data.settings.voiceLang !== 'en-US' && data.settings.voiceLang !== 'en-GB') {
+            data.settings.voiceLang = 'en-US';
+        }
+        if (typeof data.settings.speechRate !== 'number') {
+            data.settings.speechRate = 1;
+        }
+        if (typeof data.settings.autoRead !== 'boolean') {
+            data.settings.autoRead = true;
+        }
+        // 每日目标是后加的可选设置，老数据补默认值；数量不合理时回到 20
+        if (typeof data.settings.dailyGoal !== 'number' ||
+            !isFinite(data.settings.dailyGoal) || data.settings.dailyGoal < 1) {
+            data.settings.dailyGoal = 20;
         }
 
         data.books.forEach((book, index) => {

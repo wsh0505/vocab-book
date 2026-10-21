@@ -25,7 +25,10 @@
         focusBookId: null,   // 书架上居中的书
         search: '',
         study: null,         // { mode, bookId, queue, index, showAnswer, finished }
-        lastAction: null     // 最近一次答题，用于撤销
+        lastAction: null,    // 最近一次答题，用于撤销
+        libFilter: 'all',    // 单词库筛选：all | new | learning | due | overdue | mastered
+        libSort: 'order',    // 单词库排序：order | alpha | recent | stage
+        continueBookId: null // 首页「继续学习」指向的词书
     };
 
     let deferredPrompt = null;   // PWA 安装事件（Android Chrome）
@@ -191,20 +194,139 @@
     }
 
     /* =========================================================
+     * 首页数据汇总（今日概览 / 本周趋势）
+     * ========================================================= */
+
+    const WEEKDAY_TEXT = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+    /** 是否算「已掌握」 */
+    function isMastered(word) {
+        return word.status === 'mastered' || word.stage >= Schedule.MAX_STAGE;
+    }
+
+    /** 今天是否需要复习（含逾期） */
+    function isDueWord(word, now) {
+        return word.stage >= 0 && word.nextReview !== null && Schedule.overdueDays(word, now) >= 0;
+    }
+
+    /** 是否已经逾期（至少晚了一天） */
+    function isOverdueWord(word, now) {
+        return word.stage >= 0 && word.nextReview !== null && Schedule.overdueDays(word, now) > 0;
+    }
+
+    /** 全部词书的今日汇总 */
+    function todaySummary() {
+        const books = Store.getBooks();
+        const now = Date.now();
+        const sum = {
+            totalBooks: books.length,
+            total: 0,
+            learned: 0,
+            dueCount: 0,
+            overdueCount: 0,
+            todayNew: 0,
+            todayReviewed: 0
+        };
+        books.forEach((book) => {
+            const stats = Schedule.stats(book, now);
+            sum.total += stats.total;
+            sum.learned += stats.learned;
+            sum.dueCount += stats.dueCount;
+            sum.overdueCount += stats.overdueCount;
+            sum.todayNew += stats.todayNew;
+            sum.todayReviewed += stats.todayReviewed;
+        });
+        return sum;
+    }
+
+    /** 最近 7 天每天的新学 + 复习数量（没有数据的日子就是 0，不伪造） */
+    function weekTrend() {
+        const books = Store.getBooks();
+        const base = Utils.startOfDay(Date.now());
+        const days = [];
+        for (let i = 6; i >= 0; i -= 1) {
+            const ts = base - i * 86400000;
+            const key = Utils.dateKey(ts);
+            let newLearned = 0;
+            let reviewed = 0;
+            books.forEach((book) => {
+                const daily = book.dailyLog[key];
+                if (daily) {
+                    newLearned += daily.newLearned || 0;
+                    reviewed += daily.reviewed || 0;
+                }
+            });
+            const date = new Date(ts);
+            days.push({
+                key: key,
+                newLearned: newLearned,
+                reviewed: reviewed,
+                total: newLearned + reviewed,
+                isToday: i === 0,
+                weekday: WEEKDAY_TEXT[date.getDay()],
+                md: (date.getMonth() + 1) + '/' + date.getDate()
+            });
+        }
+        return days;
+    }
+
+    /** 最近真正学过（复习或新学）的那本词书，没有就返回 null */
+    function lastActiveBook() {
+        let best = null;
+        let bestTs = 0;
+        Store.getBooks().forEach((book) => {
+            let ts = 0;
+            book.words.forEach((word) => {
+                ts = Math.max(ts, word.lastReviewAt || 0, word.learnedAt || 0);
+            });
+            if (ts > bestTs) {
+                bestTs = ts;
+                best = book;
+            }
+        });
+        return bestTs > 0 ? best : null;
+    }
+
+    /**
+     * 今天该学哪一本：待复习最多的优先，其次还有新词的，同分时倾向最近学过的那本
+     * 一本都没有时返回 null
+     */
+    function pickTodayBook() {
+        const books = Store.getBooks();
+        if (books.length === 0) {
+            return null;
+        }
+        const now = Date.now();
+        const active = lastActiveBook();
+        let best = null;
+        let bestScore = -1;
+        books.forEach((book) => {
+            const stats = Schedule.stats(book, now);
+            let score = stats.dueCount * 10 + (stats.unlearned > 0 ? 2 : 0);
+            if (active && book.id === active.id) {
+                score += 0.5;   // 只用于打平时的偏好，不会盖过真正有待复习的书
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                best = book;
+            }
+        });
+        return best;
+    }
+
+    /** 中文日期，例如「10月21日 · 周三」 */
+    function chineseDateText(now) {
+        const date = new Date(now);
+        return (date.getMonth() + 1) + '月' + date.getDate() + '日 · ' + WEEKDAY_TEXT[date.getDay()];
+    }
+
+    /* =========================================================
      * 首页：横向书架
      * ========================================================= */
 
     function renderHome() {
         const books = Store.getBooks();
         const now = Date.now();
-
-        let totalDue = 0;
-        let totalOverdue = 0;
-        books.forEach((book) => {
-            const stats = Schedule.stats(book, now);
-            totalDue += stats.dueCount;
-            totalOverdue += stats.overdueCount;
-        });
 
         const slots = books.map((book) => {
             const stats = Schedule.stats(book, now);
@@ -226,17 +348,6 @@
                     '</div>' +
                 '</div>';
         }).join('');
-
-        const overview = totalDue > 0
-            ? '<div class="overview">' +
-                '<div class="overview-num">' + totalDue + '</div>' +
-                '<div class="overview-text">今天需要复习的单词' +
-                    (totalOverdue > 0 ? '<br>其中 ' + totalOverdue + ' 个已经逾期' : '') +
-                '</div>' +
-              '</div>'
-            : '<div class="overview">' +
-                '<div class="overview-text">今天没有到期的复习任务，可以背几个新词。</div>' +
-              '</div>';
 
         const tip = books.length === 0
             ? '书架上还没有单词书<br>点击右边的「新建」放上第一本'
@@ -263,12 +374,160 @@
                 '</div>' +
                 '<div class="shelf-board"></div>' +
                 '<div class="shelf-tip">' + tip + '</div>' +
-                overview +
+                '<div class="dash-grid">' +
+                    todayCard() +
+                    weekCard() +
+                '</div>' +
+                continueCard() +
             '</div>';
 
         $('#btn-settings').addEventListener('click', openSettings);
         $('#add-slot').addEventListener('click', promptCreateBook);
+        const todayBtn = $('#btn-today');
+        if (todayBtn) {
+            todayBtn.addEventListener('click', startToday);
+        }
+        const contBtn = $('#btn-continue');
+        if (contBtn) {
+            contBtn.addEventListener('click', () => {
+                openBook(state.continueBookId);
+            });
+        }
         setupShelf();
+    }
+
+    /** 首页「今日学习」卡片 */
+    function todayCard() {
+        const summary = todaySummary();
+        const now = Date.now();
+        const books = Store.getBooks();
+        if (books.length === 0) {
+            return '<div class="card dash-card">' +
+                        '<div class="card-head">' +
+                            '<div class="card-title">今日学习</div>' +
+                            '<div class="card-sub">' + chineseDateText(Date.now()) + '</div>' +
+                        '</div>' +
+                        '<div class="today-empty">放上第一本单词书，就可以开始今天的学习了。</div>' +
+                        '<button class="btn btn-primary btn-block btn-lg" id="btn-today">新建单词书</button>' +
+                   '</div>';
+        }
+
+        const goal = Store.getSettings().dailyGoal || 20;
+        const doneToday = summary.todayNew + summary.todayReviewed;
+        const percent = goal > 0 ? Math.min(100, Math.round(doneToday / goal * 100)) : 0;
+
+        let hint;
+        if (summary.dueCount > 0) {
+            hint = '今天有 ' + summary.dueCount + ' 个到期单词' +
+                (summary.overdueCount > 0 ? '，其中 ' + summary.overdueCount + ' 个已经逾期' : '，先复习再背新词效果更好');
+        } else if (summary.todayNew + summary.todayReviewed > 0) {
+            hint = '今天的任务已经完成了，有空的话可以再背几个新词。';
+        } else {
+            hint = '今天没有到期的复习任务，直接背新词也可以。';
+        }
+
+        const dueClass = summary.dueCount > 0 ? ' accent' : '';
+        const overdueLine = summary.overdueCount > 0
+            ? '<div class="today-hint warn">有 ' + summary.overdueCount + ' 个单词已经逾期，建议先处理它们。</div>'
+            : '';
+
+        return '<div class="card dash-card today-card">' +
+                    '<div class="card-head">' +
+                        '<div class="card-title">今日学习</div>' +
+                        '<div class="card-sub">' + chineseDateText(now) + '</div>' +
+                    '</div>' +
+                    '<div class="today-stats">' +
+                        '<div class="today-stat' + dueClass + '">' +
+                            '<div class="today-num">' + summary.dueCount + '</div>' +
+                            '<div class="today-label">今日待复习</div>' +
+                        '</div>' +
+                        '<div class="today-stat">' +
+                            '<div class="today-num">' + summary.todayNew + '</div>' +
+                            '<div class="today-label">今日新学</div>' +
+                        '</div>' +
+                        '<div class="today-stat">' +
+                            '<div class="today-num">' + summary.todayReviewed + '</div>' +
+                            '<div class="today-label">今日已复习</div>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="today-bar"><i style="width:' + percent + '%"></i></div>' +
+                    '<div class="today-goal">今天已完成 ' + doneToday + ' / 目标 ' + goal +
+                        ' 个 · ' + percent + '%</div>' +
+                    '<div class="today-hint">' + esc(hint) + '</div>' +
+                    overdueLine +
+                    '<button class="btn btn-primary btn-block btn-lg" id="btn-today">' +
+                        (doneToday > 0 ? '继续今日学习' : '开始今日学习') +
+                    '</button>' +
+                '</div>';
+    }
+
+    /** 首页「本周学习趋势」卡片：最近 7 天真实数据 */
+    function weekCard() {
+        const trend = weekTrend();
+        const trendTotal = trend.reduce((sum, day) => sum + day.total, 0);
+        const max = Math.max.apply(null, trend.map((day) => day.total).concat([1]));
+
+        const cols = trend.map((day) => {
+            const height = day.total > 0 ? Math.max(9, Math.round(day.total / max * 100)) : 0;
+            const newShare = day.total > 0 ? Math.round(day.newLearned / day.total * 100) : 0;
+            const bar = day.total > 0
+                ? '<div class="week-bar" style="height:' + height + '%">' +
+                      '<i class="wk-rev" style="height:' + (100 - newShare) + '%"></i>' +
+                      '<i class="wk-new" style="height:' + newShare + '%"></i>' +
+                  '</div>'
+                : '<div class="week-bar week-bar-empty"></div>';
+            return '<div class="week-col' + (day.isToday ? ' today' : '') + '" title="' +
+                        day.md + ' 新学 ' + day.newLearned + ' 个 · 复习 ' + day.reviewed + ' 个">' +
+                        '<div class="week-bar-wrap">' + bar + '</div>' +
+                        '<div class="week-num">' + (day.total > 0 ? day.total : '') + '</div>' +
+                        '<div class="week-label">' + (day.isToday ? '今天' : day.weekday) + '</div>' +
+                    '</div>';
+        }).join('');
+
+        const foot = trendTotal > 0
+            ? '<div class="week-legend">' +
+                  '<span class="lg"><i class="dot new"></i>新学</span>' +
+                  '<span class="lg"><i class="dot rev"></i>复习</span>' +
+                  '<span class="week-total">最近 7 天共 ' + trendTotal + ' 个</span>' +
+              '</div>'
+            : '<div class="week-legend">' +
+                  '<span class="week-total">最近 7 天还没有学习记录，背完今天就会显示在这里。</span>' +
+              '</div>';
+
+        return '<div class="card dash-card week-card">' +
+                    '<div class="card-head">' +
+                        '<div class="card-title">本周学习趋势</div>' +
+                        '<div class="card-sub">最近 7 天</div>' +
+                    '</div>' +
+                    '<div class="week-chart">' + cols + '</div>' +
+                    foot +
+                '</div>';
+    }
+
+    /** 首页「继续学习」卡片：没有学习历史时不显示 */
+    function continueCard() {
+        const book = lastActiveBook();
+        if (!book) {
+            return '';
+        }
+        const stats = Schedule.stats(book, Date.now());
+        let desc;
+        if (stats.dueCount > 0) {
+            desc = '还有 ' + stats.dueCount + ' 个单词待复习' +
+                (stats.overdueCount > 0 ? '（' + stats.overdueCount + ' 个已逾期）' : '');
+        } else if (stats.unlearned > 0) {
+            desc = '还有 ' + stats.unlearned + ' 个新词没背';
+        } else {
+            desc = '已学 ' + stats.learned + ' / ' + stats.total + ' 个单词';
+        }
+        state.continueBookId = book.id;
+        return '<button type="button" class="card entry-card continue-card" id="btn-continue">' +
+                    '<div class="entry-main">' +
+                        '<div class="entry-title">继续学习《' + esc(book.name) + '》</div>' +
+                        '<div class="entry-desc">' + esc(desc) + '</div>' +
+                    '</div>' +
+                    '<div class="entry-arrow">›</div>' +
+                '</button>';
     }
 
     /** 书架滚动与「抬起」效果 */
@@ -461,6 +720,15 @@
             setTimeout(() => clone.remove(), 340);
         }
 
+        state.bookId = bookId;
+        state.focusBookId = bookId;
+        state.search = '';
+        state.view = 'book';
+        render(true);
+    }
+
+    /** 直接打开某本词书（跳过封面动画，用于「继续学习」这类入口） */
+    function openBook(bookId) {
         state.bookId = bookId;
         state.focusBookId = bookId;
         state.search = '';
@@ -768,6 +1036,51 @@
      * 视图：词书详情
      * ========================================================= */
 
+    /** 词书里三类互斥状态的人数式配色 */
+    const GROUP_STYLE = {
+        unlearned: { label: '未学习', color: 'var(--chart-idle)', dot: 'g-idle' },
+        learning: { label: '学习中', color: 'var(--fuzzy)', dot: 'g-learning' },
+        mastered: { label: '已掌握', color: 'var(--accent)', dot: 'g-mastered' }
+    };
+
+    /**
+     * 环形图（互斥状态：未学习 / 学习中 / 已掌握）
+     * @param {Array} groups [{ key, value }]
+     * @param {Number} total 总词数
+     */
+    function donutSvg(groups, total) {
+        const size = 132;
+        const center = size / 2;
+        const radius = 52;
+        const width = 15;
+        const circumference = 2 * Math.PI * radius;
+        let offset = 0;
+
+        const segments = total > 0
+            ? groups.map((group) => {
+                const length = group.value / total * circumference;
+                if (length <= 0) {
+                    return '';
+                }
+                const style = GROUP_STYLE[group.key];
+                const circle =
+                    '<circle class="donut-seg" cx="' + center + '" cy="' + center + '" r="' + radius + '" ' +
+                        'fill="none" stroke="' + style.color + '" stroke-width="' + width + '" ' +
+                        'stroke-dasharray="' + length.toFixed(2) + ' ' + (circumference - length).toFixed(2) + '" ' +
+                        'stroke-dashoffset="' + (-offset).toFixed(2) + '"></circle>';
+                offset += length;
+                return circle;
+            }).join('')
+            : '';
+
+        return '<svg class="donut" viewBox="0 0 ' + size + ' ' + size + '" role="img" ' +
+                    'aria-label="学习情况分布">' +
+                    '<circle cx="' + center + '" cy="' + center + '" r="' + radius + '" fill="none" ' +
+                        'stroke="var(--surface-3)" stroke-width="' + width + '"></circle>' +
+                    '<g transform="rotate(-90 ' + center + ' ' + center + ')">' + segments + '</g>' +
+                '</svg>';
+    }
+
     function renderBook() {
         const book = Store.getBook(state.bookId);
         if (!book) {
@@ -777,8 +1090,17 @@
         }
         const now = Date.now();
         const stats = Schedule.stats(book, now);
-        const nextNewText = stats.nextNewIndex === null ? '已全部学完' : '第 ' + stats.nextNewIndex + ' 个';
         const percent = stats.total === 0 ? 0 : Math.round(stats.learned / stats.total * 100);
+
+        // 三类互斥状态：未学习 / 学习中 / 已掌握
+        const masteredCount = book.words.filter(isMastered).length;
+        const learningCount = stats.learned - masteredCount;
+        const masteredPercent = stats.total === 0 ? 0 : Math.round(masteredCount / stats.total * 100);
+        const groups = [
+            { key: 'unlearned', value: stats.unlearned },
+            { key: 'learning', value: learningCount },
+            { key: 'mastered', value: masteredCount }
+        ];
 
         const reviewLabel = '开始复习 · 今日 ' + stats.dueCount;
 
@@ -789,34 +1111,63 @@
                 '<button class="icon-btn" id="btn-book-menu">⋯</button>' +
             '</div>' +
             '<div class="page">' +
-                '<div class="detail-cover" style="' + Cover.style(book.cover) + '">' +
-                    '<div class="shade"></div>' +
-                    '<div class="info">' +
-                        '<div class="name">' + esc(book.name) + '</div>' +
-                        '<div class="meta">已学 ' + stats.learned + ' / ' + stats.total +
-                            ' · ' + percent + '%</div>' +
+                '<div class="book-head">' +
+                    '<div class="book-thumb" style="' + Cover.style(book.cover) + '"></div>' +
+                    '<div class="book-head-info">' +
+                        '<div class="book-head-name">' + esc(book.name) + '</div>' +
+                        '<div class="book-head-sub">共 ' + stats.total + ' 个单词 · 已学 ' + stats.learned + ' 个</div>' +
+                        '<div class="head-bar"><i style="width:' + percent + '%"></i></div>' +
+                        '<div class="book-head-percent">学习进度 ' + percent + '%</div>' +
                     '</div>' +
                 '</div>' +
-                '<div class="stat-grid">' +
-                    statCard(stats.total, '总单词数') +
-                    statCard(stats.learned, '已学单词') +
-                    statCard(stats.unlearned, '未学单词') +
-                    statCard(stats.dueCount, '今日待复习', 'accent') +
-                    statCard(stats.overdueCount, '逾期未复习', 'warn') +
-                    statCard(stats.todayNew, '今日已背新词') +
-                    statCard(stats.todayReviewed, '今日已复习') +
-                    statCard(nextNewText, '下次新词从第几个开始') +
+                '<div class="section-title">学习情况</div>' +
+                '<div class="card progress-card">' +
+                    '<div class="progress-main">' +
+                        '<div class="donut-wrap">' +
+                            donutSvg(groups, stats.total) +
+                            '<div class="donut-center">' +
+                                '<div class="donut-num">' +
+                                    (stats.total === 0 ? '—' : masteredPercent + '%') +
+                                '</div>' +
+                                '<div class="donut-label">已掌握</div>' +
+                            '</div>' +
+                        '</div>' +
+                        '<div class="legend">' +
+                            groups.map((group) => {
+                                const style = GROUP_STYLE[group.key];
+                                const ratio = stats.total === 0
+                                    ? 0
+                                    : Math.round(group.value / stats.total * 100);
+                                return '<div class="legend-item">' +
+                                        '<i class="dot ' + style.dot + '"></i>' +
+                                        '<span class="lg-name">' + style.label + '</span>' +
+                                        '<span class="lg-val">' + group.value +
+                                            ' <em>' + ratio + '%</em></span>' +
+                                    '</div>';
+                            }).join('') +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="mini-grid">' +
+                        miniCard(stats.total, '总词数', '') +
+                        miniCard(stats.dueCount, '今日待复习', 'accent') +
+                        miniCard(stats.overdueCount, '逾期未复习', 'warn') +
+                    '</div>' +
+                    '<div class="progress-note">环形图里三类状态互不重复；' +
+                        '「待复习」和「逾期」是对同一批单词的另一种看法，不单独计入。</div>' +
                 '</div>' +
                 '<div class="action-block">' +
                     '<button class="btn btn-primary btn-lg btn-main" id="btn-start-new">开始背单词</button>' +
                     '<button class="btn btn-lg" id="btn-start-review">' + esc(reviewLabel) + '</button>' +
-                    '<button class="btn btn-lg" id="btn-practice">练习</button>' +
+                    '<button class="btn btn-lg" id="btn-practice">练习测试</button>' +
                 '</div>' +
-                '<div class="section-title" id="list-title">单词列表</div>' +
-                '<input class="search-box" id="search-box" placeholder="搜索英文、释义或备注" ' +
-                    'value="' + esc(state.search) + '">' +
-                '<div style="height:12px;"></div>' +
-                '<div id="word-region"></div>' +
+                '<div class="section-title">单词</div>' +
+                '<button type="button" class="card entry-card" id="btn-open-library">' +
+                    '<div class="entry-main">' +
+                        '<div class="entry-title">单词库</div>' +
+                        '<div class="entry-desc">共 ' + stats.total + ' 个单词 · 可搜索、按状态筛选、增删改</div>' +
+                    '</div>' +
+                    '<div class="entry-arrow">›</div>' +
+                '</button>' +
                 '<button class="btn btn-primary btn-block btn-lg" id="btn-add-word">＋ 添加新单词</button>' +
             '</div>';
 
@@ -826,31 +1177,191 @@
         $('#btn-start-review').addEventListener('click', startReview);
         $('#btn-practice').addEventListener('click', openPracticeDialog);
         $('#btn-add-word').addEventListener('click', () => openWordDialog(null));
+        $('#btn-open-library').addEventListener('click', () => openLibrary(book.id));
+    }
+
+    function miniCard(value, label, extraClass) {
+        return '<div class="mini ' + (extraClass || '') + '">' +
+                    '<div class="mini-num">' + esc(value) + '</div>' +
+                    '<div class="mini-label">' + esc(label) + '</div>' +
+               '</div>';
+    }
+
+    /** 打开这本词书的单词库（独立页面） */
+    function openLibrary(bookId) {
+        state.bookId = bookId || state.bookId;
+        state.search = '';
+        state.libFilter = 'all';
+        state.libSort = 'order';
+        state.view = 'library';
+        render(true);
+    }
+
+    /* =========================================================
+     * 单词库（独立页面）：搜索 + 筛选 + 排序 + 增删改
+     * ========================================================= */
+
+    /** 筛选条件：与详情页环形图的三类互斥状态对应，另外多了「待复习 / 逾期」两个视图 */
+    const LIB_FILTERS = [
+        { key: 'all', label: '全部' },
+        { key: 'new', label: '未学习' },
+        { key: 'learning', label: '学习中' },
+        { key: 'due', label: '待复习' },
+        { key: 'overdue', label: '逾期' },
+        { key: 'mastered', label: '已掌握' }
+    ];
+
+    const LIB_SORTS = [
+        { key: 'order', label: '添加顺序' },
+        { key: 'alpha', label: '字母 A→Z' },
+        { key: 'recent', label: '最近学习' },
+        { key: 'stage', label: '复习阶段' }
+    ];
+
+    /** 单个单词是否命中某个筛选条件 */
+    function matchLibFilter(word, key, now) {
+        switch (key) {
+            case 'new':
+                return word.stage < 0;
+            case 'learning':
+                return word.stage >= 0 && !isMastered(word);
+            case 'due':
+                return isDueWord(word, now);
+            case 'overdue':
+                return isOverdueWord(word, now);
+            case 'mastered':
+                return isMastered(word);
+            default:
+                return true;
+        }
+    }
+
+    /** 排序；order 保持原添加顺序，不做重排 */
+    function sortLibraryWords(list, key) {
+        const arr = list.slice();
+        if (key === 'alpha') {
+            arr.sort((a, b) => a.english.localeCompare(b.english, 'en'));
+        } else if (key === 'recent') {
+            arr.sort((a, b) =>
+                (b.lastReviewAt || b.learnedAt || 0) - (a.lastReviewAt || a.learnedAt || 0));
+        } else if (key === 'stage') {
+            arr.sort((a, b) => (a.stage - b.stage) || a.english.localeCompare(b.english, 'en'));
+        }
+        return arr;
+    }
+
+    function renderLibrary() {
+        const book = Store.getBook(state.bookId);
+        if (!book) {
+            state.view = 'home';
+            renderHome();
+            return;
+        }
+        const now = Date.now();
+        const filter = state.libFilter || 'all';
+        const sort = state.libSort || 'order';
+
+        $('#app').innerHTML =
+            '<div class="topbar">' +
+                '<button class="icon-btn" id="btn-back">←</button>' +
+                '<div class="topbar-title">单词库</div>' +
+                '<button class="icon-btn" id="btn-add-word-top" title="添加新单词">＋</button>' +
+            '</div>' +
+            '<div class="page">' +
+                '<div class="library-head">' +
+                    '<div class="library-book">《' + esc(book.name) + '》</div>' +
+                    '<div class="library-count" id="library-count"></div>' +
+                '</div>' +
+                '<input class="search-box" id="search-box" ' +
+                    'placeholder="搜索英文、释义、备注或用法" autocomplete="off" ' +
+                    'value="' + esc(state.search) + '">' +
+                '<div class="chip-row" id="filter-chips">' +
+                    LIB_FILTERS.map((item) =>
+                        '<button type="button" class="chip' + (filter === item.key ? ' active' : '') +
+                            '" data-filter="' + item.key + '">' + esc(item.label) +
+                            '<span class="chip-num" data-count="' + item.key + '"></span>' +
+                        '</button>'
+                    ).join('') +
+                '</div>' +
+                '<div class="chip-row chip-row-sub" id="sort-chips">' +
+                    '<span class="chip-label">排序</span>' +
+                    LIB_SORTS.map((item) =>
+                        '<button type="button" class="chip chip-sm' + (sort === item.key ? ' active' : '') +
+                            '" data-sort="' + item.key + '">' + esc(item.label) + '</button>'
+                    ).join('') +
+                '</div>' +
+                '<div id="word-region"></div>' +
+                '<button class="btn btn-primary btn-block btn-lg" id="btn-add-word">＋ 添加新单词</button>' +
+            '</div>';
+
+        $('#btn-back').addEventListener('click', () => openBook(book.id));
+        $('#btn-add-word-top').addEventListener('click', () => openWordDialog(null));
+        $('#btn-add-word').addEventListener('click', () => openWordDialog(null));
 
         const search = $('#search-box');
         search.addEventListener('input', () => {
             state.search = search.value;
-            renderWordList(book, now);
+            renderLibraryList(book, Date.now());
         });
 
-        renderWordList(book, now);
+        $$('#filter-chips .chip').forEach((chip) => {
+            chip.addEventListener('click', () => {
+                state.libFilter = chip.getAttribute('data-filter');
+                $$('#filter-chips .chip').forEach((other) => {
+                    other.classList.toggle('active', other === chip);
+                });
+                renderLibraryList(book, Date.now());
+            });
+        });
+
+        $$('#sort-chips .chip').forEach((chip) => {
+            chip.addEventListener('click', () => {
+                state.libSort = chip.getAttribute('data-sort');
+                $$('#sort-chips .chip').forEach((other) => {
+                    other.classList.toggle('active', other === chip);
+                });
+                renderLibraryList(book, Date.now());
+            });
+        });
+
+        renderLibraryList(book, now);
     }
 
-    /** 渲染单词列表（含搜索过滤） */
-    function renderWordList(book, now) {
+    /** 渲染单词库列表：只重画列表区域，避免搜索框失焦 */
+    function renderLibraryList(book, now) {
         const keyword = state.search.trim().toLowerCase();
-        const words = book.words.filter((word) => {
+        const filter = state.libFilter || 'all';
+        const sort = state.libSort || 'order';
+
+        // 先按关键词过滤，再统计各筛选项的数量
+        const searched = book.words.filter((word) => {
             if (!keyword) {
                 return true;
             }
             const hay = (word.english + ' ' + word.meanings.join(' ') + ' ' +
-                word.note + ' ' + (word.usage || '')).toLowerCase();
+                (word.note || '') + ' ' + (word.usage || '')).toLowerCase();
             return hay.indexOf(keyword) >= 0;
         });
 
-        const title = document.getElementById('list-title');
-        if (title) {
-            title.textContent = '单词列表（' + words.length + '）';
+        LIB_FILTERS.forEach((item) => {
+            const count = searched.filter((word) => matchLibFilter(word, item.key, now)).length;
+            $$('[data-count="' + item.key + '"]').forEach((node) => {
+                node.textContent = count;
+            });
+        });
+
+        const list = sortLibraryWords(
+            searched.filter((word) => matchLibFilter(word, filter, now)),
+            sort
+        );
+
+        const countNode = document.getElementById('library-count');
+        if (countNode) {
+            const filterText = filter === 'all' ? '' : ' · ' + (LIB_FILTERS.filter(
+                (item) => item.key === filter
+            )[0] || {}).label;
+            countNode.textContent = '共 ' + book.words.length + ' 个单词' +
+                filterText + ' · 当前显示 ' + list.length + ' 个';
         }
 
         const region = document.getElementById('word-region');
@@ -858,48 +1369,76 @@
             return;
         }
 
-        if (words.length === 0) {
+        if (list.length === 0) {
+            const empty = libraryEmptyHtml(book.words.length === 0, keyword, filter);
             region.innerHTML =
                 '<div class="empty">' +
-                    '<div class="empty-title">' +
-                        (keyword ? '没有匹配的单词' : '这本单词书还没有单词') +
-                    '</div>' +
-                    '<div>' + (keyword ? '换个关键词试试。' : '点击下面的按钮添加第一个单词。') + '</div>' +
+                    '<div class="empty-title">' + esc(empty.title) + '</div>' +
+                    '<div>' + esc(empty.desc) + '</div>' +
                 '</div>';
         } else {
             region.innerHTML = '<div class="word-list">' +
-                words.map((word) => wordItemHtml(word, now)).join('') +
+                list.map((word) => wordItemHtml(word, now)).join('') +
                 '</div>';
             bindWordItems();
         }
     }
 
-    function statCard(value, label, extraClass) {
-        return '<div class="stat-card ' + (extraClass || '') + '">' +
-                    '<div class="stat-value">' + esc(value) + '</div>' +
-                    '<div class="stat-label">' + esc(label) + '</div>' +
-               '</div>';
+    /** 单词库四种空状态，文案统一风格，不伪造数据 */
+    function libraryEmptyHtml(noWords, keyword, filter) {
+        if (noWords) {
+            return { title: '这本单词书还没有单词', desc: '点下面的「添加新单词」放进第一个单词。' };
+        }
+        if (keyword) {
+            return { title: '没有匹配的单词', desc: '换个关键词，或者清空搜索框看看全部单词。' };
+        }
+        if (filter === 'due') {
+            return { title: '今天没有需要复习的单词', desc: '按遗忘曲线，今天到期的都复习完了，明天再来看看。' };
+        }
+        if (filter === 'overdue') {
+            return { title: '没有逾期的单词', desc: '目前没有落下的复习，保持住就行。' };
+        }
+        if (filter === 'new') {
+            return { title: '没有未学习的单词', desc: '这本词书里的单词都已经开始学了。' };
+        }
+        if (filter === 'learning') {
+            return { title: '没有正在学习的单词', desc: '当前的单词要么还没开始学，要么已经掌握了。' };
+        }
+        if (filter === 'mastered') {
+            return { title: '还没有掌握的单词', desc: '复习到第 8 阶段会自动标记为已掌握。' };
+        }
+        return { title: '这里还没有单词', desc: '换个筛选条件，或者添加新单词。' };
     }
 
     function wordItemHtml(word, now) {
-        const overdueDays = Schedule.overdueDays(word, now);
-        const isDue = word.stage >= 0 && word.nextReview !== null && overdueDays >= 0;
-        let badge;
-        if (word.status === 'mastered' || word.stage >= Schedule.MAX_STAGE) {
-            badge = '<span class="badge mastered">已掌握</span>';
-        } else if (word.stage < 0) {
-            badge = '<span class="badge">未学习</span>';
+        // 学习状态：未学习 / 学习中 / 已掌握
+        const status = Schedule.statusText(word);
+        let badgeClass = '';
+        if (word.stage < 0) {
+            badgeClass = '';
+        } else if (isMastered(word)) {
+            badgeClass = ' mastered';
         } else {
-            badge = '<span class="badge stage">' + esc(Schedule.stageText(word.stage)) + '</span>';
+            badgeClass = ' stage';
         }
-        let dueText = '';
-        if (isDue && overdueDays > 0) {
-            dueText = '<span class="word-due" style="color:var(--unknown);">逾期 ' + overdueDays + ' 天</span>';
-        } else if (isDue) {
-            dueText = '<span class="word-due">今天到期</span>';
+
+        // 第二行右侧的补充信息：到期情况优先，其次是下次复习时间，最后是阶段
+        let extra = '';
+        let extraClass = 'word-due';
+        if (word.stage < 0) {
+            extra = '还没开始学';
+        } else if (isOverdueWord(word, now)) {
+            extra = '逾期 ' + Schedule.overdueDays(word, now) + ' 天';
+            extraClass = 'word-due is-overdue';
+        } else if (isDueWord(word, now)) {
+            extra = '今天到期';
+            extraClass = 'word-due is-due';
         } else if (word.nextReview !== null) {
-            dueText = '<span class="word-due">' + Utils.formatDate(word.nextReview) + ' 复习</span>';
+            extra = Utils.formatDate(word.nextReview) + ' 复习';
+        } else {
+            extra = Schedule.stageText(word.stage);
         }
+
         return '' +
             '<button class="word-item" data-word="' + word.id + '">' +
                 '<div class="word-main">' +
@@ -907,9 +1446,9 @@
                     '<div class="word-mean">' + esc(word.meanings.join('；')) + '</div>' +
                 '</div>' +
                 '<div class="word-meta">' +
-                    badge +
-                    '<span class="word-due">共 ' + word.meanings.length + ' 条释义</span>' +
-                    dueText +
+                    '<span class="badge' + badgeClass + '">' + esc(status) + '</span>' +
+                    '<span class="word-due">' + word.meanings.length + ' 条释义</span>' +
+                    '<span class="' + extraClass + '">' + esc(extra) + '</span>' +
                 '</div>' +
             '</button>';
     }
@@ -1104,6 +1643,57 @@
      * 背单词 / 复习 / 练习
      * ========================================================= */
 
+    /**
+     * 首页「开始今日学习」：先复习到期单词，数量不够再用新词补足到每日目标
+     * 队列为空时不假装有任务，给出温和提示
+     */
+    function startToday() {
+        const book = pickTodayBook();
+        if (!book) {
+            promptCreateBook();
+            return;
+        }
+
+        const now = Date.now();
+        const stats = Schedule.stats(book, now);
+        const goal = Store.getSettings().dailyGoal || 20;
+        const doneToday = stats.todayNew + stats.todayReviewed;
+        const remain = Math.max(0, goal - doneToday);
+
+        // 到期的先来，超出剩余目标的部分留到明天（不会消失，只是今天先不练）
+        let queue = stats.due.slice(0, remain);
+        if (remain > queue.length) {
+            queue = queue.concat(stats.newWords.slice(0, remain - queue.length));
+        }
+
+        if (queue.length === 0) {
+            openModal({
+                title: '今天的学习任务已经完成',
+                body: '<div style="padding:6px 0 12px;line-height:1.7;">' +
+                        '今天已经完成 ' + doneToday + ' 个（目标 ' + goal + ' 个）。' +
+                        (stats.unlearned > 0
+                            ? '想继续的话，可以到单词书里点「开始背单词」再多背几个新词。'
+                            : '明天会有自动安排好的复习，到时候再来。') +
+                      '</div>',
+                actions: [
+                    { label: '知道了', className: 'btn-primary', onClick: (close) => close() },
+                    {
+                        label: '打开单词书',
+                        onClick: (close) => {
+                            close();
+                            openBook(book.id);
+                        }
+                    }
+                ]
+            });
+            return;
+        }
+
+        state.bookId = book.id;
+        state.focusBookId = book.id;
+        enterStudy('today', queue);
+    }
+
     function startNewWords() {
         const book = Store.getBook(state.bookId);
         const queue = Schedule.newWords(book);
@@ -1146,6 +1736,54 @@
         };
         state.lastAction = null;
         render(true);
+    }
+
+    /* =========================================================
+     * 朗读（Web Speech API，纯本地合成）
+     * ========================================================= */
+
+    // 喇叭图标：用内联 SVG 而非 emoji，保证深浅色、各平台观感一致
+    const SPEAK_ICON =
+        '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" ' +
+            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>' +
+            '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>' +
+            '<path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>' +
+        '</svg>';
+
+    /** 英文单词旁边的喇叭按钮；浏览器不支持朗读时不渲染 */
+    function speakButtonHtml() {
+        if (!global.TTS.supported()) {
+            return '';
+        }
+        return '<button type="button" class="speak-btn" id="btn-speak" ' +
+            'aria-label="朗读这个单词">' + SPEAK_ICON + '</button>';
+    }
+
+    function bindSpeakButton(text) {
+        const btn = $('#btn-speak');
+        if (!btn) {
+            return;
+        }
+        btn.addEventListener('click', (event) => {
+            event.preventDefault();
+            speakWord(text);
+        });
+    }
+
+    /** 手动点击喇叭 */
+    function speakWord(text) {
+        if (!global.TTS.speak(text)) {
+            toast('朗读失败，检查一下系统里有没有安装英语语音包');
+        }
+    }
+
+    /** 自动朗读：切到下一个单词时读一遍，可在设置里关掉 */
+    function autoSpeakWord(text) {
+        if (!Store.getSettings().autoRead) {
+            return;
+        }
+        global.TTS.speak(text);
     }
 
     function renderStudy() {
@@ -1200,14 +1838,18 @@
         if (study.finished || study.index >= study.queue.length) {
             study.finished = true;
             const doneCount = study.queue.length;
-            const modeText = study.mode === 'new' ? '新词' : (study.mode === 'review' ? '复习' : '练习');
+            const modeText = study.mode === 'new' ? '新词'
+                : (study.mode === 'review' ? '复习'
+                : (study.mode === 'today' ? '今日' : '练习'));
             progress.textContent = '本次完成 ' + doneCount + ' 个';
+            const backText = study.mode === 'today' ? '返回首页' : '返回单词书';
             body.innerHTML =
                 '<div class="empty">' +
                     '<div class="empty-title">这一轮结束了</div>' +
                     '<div>共完成 ' + doneCount + ' 个' + modeText + '单词。</div>' +
                 '</div>' +
-                '<button class="btn btn-primary btn-block btn-lg" id="btn-finish-back">返回单词书</button>';
+                '<button class="btn btn-primary btn-block btn-lg" id="btn-finish-back">' +
+                    backText + '</button>';
             actions.style.display = 'none';
             tip.textContent = '';
             $('#btn-finish-back').addEventListener('click', exitStudy);
@@ -1218,13 +1860,19 @@
 
             if (study.mode === 'new') {
                 progress.textContent = '第 ' + orderInBook + ' 个 · 还剩 ' + remain + ' 个没背';
+            } else if (study.mode === 'today') {
+                progress.textContent = '今日 ' + (study.index + 1) + ' / ' + study.queue.length +
+                    ' · 还剩 ' + remain + ' 个';
             } else {
                 progress.textContent = (study.mode === 'review' ? '复习 ' : '练习 ') +
                     (study.index + 1) + ' / ' + study.queue.length + ' · 还剩 ' + remain + ' 个';
             }
 
             body.innerHTML =
-                '<div class="study-word">' + esc(word.english) + '</div>' +
+                '<div class="study-word-row">' +
+                    '<div class="study-word">' + esc(word.english) + '</div>' +
+                    speakButtonHtml() +
+                '</div>' +
                 (word.note
                     ? '<div class="study-note"><div class="study-note-title">备注</div>' +
                       esc(word.note) + '</div>'
@@ -1238,6 +1886,11 @@
                 '</div>';
 
             $('#btn-show-answer').addEventListener('click', showAnswer);
+            bindSpeakButton(word.english);
+
+            // 进入下一个单词自动读一遍（开关在设置里，默认开启）
+            autoSpeakWord(word.english);
+
             $('#answer-input').addEventListener('keydown', (event) => {
                 if (event.key === 'Enter') {
                     event.preventDefault();
@@ -1256,6 +1909,8 @@
                 tip.textContent = '练习模式：只做记录，不改变复习计划';
             } else if (study.mode === 'new') {
                 tip.textContent = '没点按钮就退出，这个单词下次还会出现';
+            } else if (study.mode === 'today') {
+                tip.textContent = '今日任务：到期的单词在前，后面接新词';
             } else {
                 tip.textContent = '没复习完的单词会自动顺延到明天';
             }
@@ -1359,7 +2014,15 @@
     }
 
     function exitStudy() {
-        state.view = 'book';
+        global.TTS.cancel();   // 离开背单词页就停下朗读，别让它读到详情页去
+        const fromToday = state.study && state.study.mode === 'today';
+        if (fromToday) {
+            // 从首页的「今日学习」进来，退出就回到首页
+            state.view = 'home';
+            state.bookId = null;
+        } else {
+            state.view = 'book';
+        }
         state.study = null;
         state.lastAction = null;
         render(true);
@@ -1458,6 +2121,10 @@
 
     function openSettings() {
         const settings = Store.getSettings();
+        const ttsSupported = global.TTS.supported();
+        if (ttsSupported) {
+            global.TTS.apply(settings);
+        }
         const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
         const standalone = global.navigator.standalone === true ||
             (global.matchMedia && global.matchMedia('(display-mode: standalone)').matches);
@@ -1494,11 +2161,53 @@
                     '</div>' +
                 '</div>' +
                 '<div class="setting-row">' +
+                    '<div class="setting-label">每日目标</div>' +
+                    '<div class="seg" id="goal-seg">' +
+                        [10, 20, 30, 50].map((item) =>
+                            segItem(String(item), item + ' 个', String(settings.dailyGoal || 20))
+                        ).join('') +
+                    '</div>' +
+                    '<div class="setting-desc">每天要完成的「新学 + 复习」总数，首页会按这个显示进度条。</div>' +
+                '</div>' +
+                '<div class="setting-row">' +
                     '<div class="setting-label">添加到主屏幕</div>' +
                     '<div class="setting-desc">' + esc(installTip) + '</div>' +
                     '<button class="btn btn-block" id="btn-install" style="margin-top:10px;display:none;">' +
                         '添加到主屏幕</button>' +
                 '</div>' +
+                (ttsSupported
+                    ? '<div class="setting-row">' +
+                          '<div class="setting-label">语音类型</div>' +
+                          '<div class="seg" id="voice-seg">' +
+                              segItem('en-US', '美音 en-US', settings.voiceLang) +
+                              segItem('en-GB', '英音 en-GB', settings.voiceLang) +
+                          '</div>' +
+                          '<div class="setting-desc" id="voice-hint"></div>' +
+                      '</div>' +
+                      '<div class="setting-row">' +
+                          '<div class="setting-label">自动朗读</div>' +
+                          '<div class="seg" id="autoread-seg">' +
+                              segItem('on', '开启', settings.autoRead ? 'on' : 'off') +
+                              segItem('off', '关闭', settings.autoRead ? 'on' : 'off') +
+                          '</div>' +
+                          '<div class="setting-desc">开启后，每切到一个新单词就自动读一遍；' +
+                              '关闭则只在点单词旁边的喇叭时朗读。</div>' +
+                      '</div>' +
+                      '<div class="setting-row">' +
+                          '<div class="setting-label">语速</div>' +
+                          '<input class="slider" id="rate-slider" type="range" ' +
+                              'min="0.6" max="1.4" step="0.1" value="' + settings.speechRate + '">' +
+                          '<div class="setting-desc" id="rate-value">当前：' +
+                              Math.round(settings.speechRate * 100) + '%</div>' +
+                          '<button class="btn btn-block" id="btn-tts-test" style="margin-top:10px;">' +
+                              '试听一下</button>' +
+                      '</div>'
+                    : '<div class="setting-row">' +
+                          '<div class="setting-label">朗读</div>' +
+                          '<div class="setting-desc">当前浏览器不支持网页朗读。' +
+                              '建议换用最新版 Chrome、Edge 或 Safari 打开。</div>' +
+                      '</div>'
+                ) +
                 '<div class="setting-row">' +
                     '<div class="setting-label">数据保存</div>' +
                     '<div class="setting-desc">所有单词和复习记录都保存在这台设备的浏览器本地，' +
@@ -1532,6 +2241,17 @@
                     $('#font-value', mask).textContent = '当前：' + Math.round(value * 100) + '%';
                 });
 
+                $$('#goal-seg .seg-item', mask).forEach((item) => {
+                    item.addEventListener('click', () => {
+                        $$('#goal-seg .seg-item', mask).forEach((other) =>
+                            other.classList.remove('active'));
+                        item.classList.add('active');
+                        Store.updateSettings({
+                            dailyGoal: parseInt(item.getAttribute('data-value'), 10) || 20
+                        });
+                    });
+                });
+
                 // 备份信息：当前有多少书、多少词
                 const stat = $('#backup-stat', mask);
                 if (stat) {
@@ -1541,6 +2261,78 @@
 
                 $('#btn-export', mask).addEventListener('click', exportData);
                 $('#btn-import', mask).addEventListener('click', importData);
+
+                // ---- 朗读设置 ----
+                if (ttsSupported) {
+                    /** 语音包匹配情况提示（始终读最新设置） */
+                    function updateVoiceHint() {
+                        const hint = $('#voice-hint', mask);
+                        if (!hint) {
+                            return;
+                        }
+                        const exact = global.TTS.exactVoices();
+                        const lang = Store.getSettings().voiceLang;
+                        if (exact.length === 0) {
+                            hint.textContent = '系统里没有检测到 en-US / en-GB 语音包，' +
+                                '会尝试用设备默认的英语发音朗读。';
+                        } else if (exact.indexOf(lang) < 0) {
+                            hint.textContent = '当前选择了 ' + lang + '，但本机只装了 ' +
+                                exact.join(' / ') + '，会自动退化为已有的英语发音。';
+                        } else {
+                            hint.textContent = '已匹配到系统自带的 ' + lang + ' 语音包。';
+                        }
+                    }
+                    updateVoiceHint();
+                    // 语音包是异步返回的，稍后再刷一次提示
+                    setTimeout(updateVoiceHint, 700);
+
+                    /** 高亮某个分段控件里被选中的那一项 */
+                    function pickSeg(segId, value) {
+                        $$('#' + segId + ' .seg-item', mask).forEach((item) => {
+                            item.classList.toggle('active', item.getAttribute('data-value') === value);
+                        });
+                    }
+
+                    $$('#voice-seg .seg-item', mask).forEach((item) => {
+                        item.addEventListener('click', () => {
+                            const lang = item.getAttribute('data-value');
+                            pickSeg('voice-seg', lang);
+                            Store.updateSettings({ voiceLang: lang });
+                            global.TTS.setLang(lang);
+                            updateVoiceHint();
+                            global.TTS.speak('pronunciation');   // 切完立刻听一下效果
+                        });
+                    });
+
+                    $$('#autoread-seg .seg-item', mask).forEach((item) => {
+                        item.addEventListener('click', () => {
+                            const on = item.getAttribute('data-value') === 'on';
+                            pickSeg('autoread-seg', on ? 'on' : 'off');
+                            Store.updateSettings({ autoRead: on });
+                            if (on) {
+                                global.TTS.speak('auto read on');
+                            }
+                        });
+                    });
+
+                    const rateSlider = $('#rate-slider', mask);
+                    if (rateSlider) {
+                        rateSlider.addEventListener('input', () => {
+                            const value = parseFloat(rateSlider.value);
+                            Store.updateSettings({ speechRate: value });
+                            global.TTS.setRate(value);
+                            $('#rate-value', mask).textContent =
+                                '当前：' + Math.round(value * 100) + '%';
+                        });
+                    }
+
+                    const testBtn = $('#btn-tts-test', mask);
+                    if (testBtn) {
+                        testBtn.addEventListener('click', () => {
+                            global.TTS.speak('pronunciation');
+                        });
+                    }
+                }
 
                 const installBtn = $('#btn-install', mask);
                 if (deferredPrompt) {
@@ -1665,6 +2457,7 @@
                                 Store.replaceAll(data);
                                 applyTheme();
                                 applyFontScale();
+                                global.TTS.apply(Store.getSettings());
                                 state.view = 'home';
                                 state.bookId = null;
                                 render();
@@ -1681,9 +2474,13 @@
      * 启动
      * ========================================================= */
 
+    let lastRenderedView = null;
+
     function render(animate) {
         if (state.view === 'book') {
             renderBook();
+        } else if (state.view === 'library') {
+            renderLibrary();
         } else if (state.view === 'study') {
             renderStudy();
         } else {
@@ -1695,12 +2492,19 @@
                 page.classList.add('enter');
             }
         }
+        // 换页时回到顶部：上一页留下的滚动位置会把新页面顶部压在吸顶栏下面
+        if (state.view !== lastRenderedView) {
+            global.scrollTo(0, 0);
+        }
+        lastRenderedView = state.view;
     }
 
     function boot() {
         Store.load();
         applyTheme();
         applyFontScale();
+        // 朗读模块初始化：按本地保存的语音类型与语速设置好
+        global.TTS.apply(Store.getSettings());
         render();
 
         if (global.matchMedia) {
